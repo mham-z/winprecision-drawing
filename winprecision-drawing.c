@@ -7,6 +7,7 @@
 #include <hidsdi.h>
 #include <time.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <math.h>
 
 #define OUT_BUFFER_SIZE 4096
@@ -22,13 +23,12 @@ int shiftMode = SHIFT_MODE_LIFT;
 unsigned twofinger_detect_delay_clocks = CLOCKS_PER_SEC * 50 / 1000;
 unsigned click_detect_delay_clocks = CLOCKS_PER_SEC * 50 / 1000;
 HHOOK miHook;
-unsigned num_fingers = 0;
 clock_t last_click = 0;
 clock_t last_problem_twofinger_time = 0;
-int touching;
+bool touching = false;
 int drawX;
 int drawY;
-float touchpadAspect = 1.0f; // this will be assigned the actual aspect ratio later
+float aspectRatio;
 
 HWND overlayWnd = NULL;
 
@@ -38,14 +38,14 @@ unsigned outBufferTail;
 
 #define KEY_MAIN_ACTIVATE_MOD  0x1D // ctrl
 #define KEY_QUICK_ACTIVATE_MOD 0x38 // alt
-#define KEY_ACTIVATE		   0x5B // win
+#define KEY_ACTIVATE		   0x5B // super
 #define KEY_LEFT_SHIFT 0x2a
 #define KEY_RIGHT_SHIFT 0x36
 
-int downMainMod = 0;
-int downQuickMod = 0;
-int downActivate = 0;
-int downShift = 0;
+bool downMainMod = false;
+bool downQuickMod = false;
+bool downActivate = false;
+bool downShift = false;
 
 #define INPUT_WAIT 1234
 
@@ -56,8 +56,6 @@ enum {
 };
 
 int mode = 0;
-
-int active = 0;
 int mouseX = 0;
 int mouseY = 0;
 int topLeftX;
@@ -65,8 +63,9 @@ int topLeftY;
 int bottomRightX;
 int bottomRightY;
 
+volatile bool running = true;
+
 HANDLE queueReady;
-char running = 1;
 
 int popBuffer(INPUT* ip) {
     if (outBufferHead == outBufferTail)
@@ -140,11 +139,14 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 				int absWidth  = abs(rawWidth);
 				int absHeight = abs(rawHeight);
 
+				if (absHeight < 5) absHeight = 5;
+				if (absWidth < 5) absWidth = 5;
+
 				// preserve aspect ratio
-				if (absWidth / (float)absHeight > touchpadAspect)
-					absWidth = (int)(absHeight * touchpadAspect + 0.5f);
+				if (absWidth / (float)absHeight > aspectRatio)
+					absWidth = (int)(absHeight * aspectRatio + 0.5f);
 				else
-					absHeight = (int)(absWidth / touchpadAspect + 0.5f);
+					absHeight = (int)(absWidth / aspectRatio + 0.5f);
 
 				rawWidth  = (rawWidth < 0) ? -absWidth : absWidth;
 				rawHeight = (rawHeight < 0) ? -absHeight : absHeight;
@@ -222,7 +224,6 @@ long getScaled(unsigned scale, unsigned usagePage, unsigned usage, unsigned scal
 }
 
 void moveMouse(int x, int y) {
-	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 	INPUT ip;
     ip.type = INPUT_MOUSE;
     ip.mi.dx = x*65536/GetSystemMetrics(SM_CXSCREEN);
@@ -338,7 +339,7 @@ void showActivate(int state, int ms) {
 }
 
 void handleKeyboard(USHORT code, USHORT flags) {
-	int down = (flags & 1) ^ 1;
+	bool down = ! (flags & 1);
 	if (code == KEY_MAIN_ACTIVATE_MOD) 
 		downMainMod = down;
 	else if (code == KEY_QUICK_ACTIVATE_MOD)
@@ -363,22 +364,21 @@ void handleKeyboard(USHORT code, USHORT flags) {
 
 						int absWidth  = abs(rawWidth);
 						int absHeight = abs(rawHeight);
+						
+						if (absHeight < 5) absHeight = 5;
+						if (absWidth < 5) absWidth = 5;
 
-						// preserve aspect ratio
-						if (absWidth / (float)absHeight > touchpadAspect)
-							absWidth = (int)(absHeight * touchpadAspect + 0.5f);
+						if (absWidth / (float)absHeight > aspectRatio)
+							absWidth = (int)(absHeight * aspectRatio + 0.5f);
 						else
-							absHeight = (int)(absWidth / touchpadAspect + 0.5f);
+							absHeight = (int)(absWidth / aspectRatio + 0.5f);
 
-						// restore signs based on drag direction
 						rawWidth  = (rawWidth < 0) ? -absWidth : absWidth;
 						rawHeight = (rawHeight < 0) ? -absHeight : absHeight;
 
-						// calculate temporary coordinates
 						int x2 = topLeftX + rawWidth;
 						int y2 = topLeftY + rawHeight;
 
-						// assign final rectangle
 						int finalLeft   = min(topLeftX, x2);
 						int finalRight  = max(topLeftX, x2);
 						int finalTop    = min(topLeftY, y2);
@@ -390,7 +390,7 @@ void handleKeyboard(USHORT code, USHORT flags) {
 						bottomRightY = finalBottom;
 
 						mode = MODE_ACTIVE;
-						touching = 0;
+						touching = false;
 						showActivate(1,50);
 						drawX = -1;
 						drawY = -1;
@@ -413,7 +413,7 @@ void handleKeyboard(USHORT code, USHORT flags) {
 			else {
 				//printf("area: (%d,%d)-(%d,%d)\n",topLeftX,topLeftY,bottomRightX,bottomRightY);
 				mode = MODE_ACTIVE;
-				touching = 0;
+				touching = false;
 				showActivate(1,50);
 				drawX = -1;
 				drawY = -1;
@@ -457,7 +457,7 @@ LRESULT CALLBACK EventHandler(
 				return 0;
 			
 			unsigned long usageLength = sizeof(usageBuffer)/sizeof(USAGE);
-			int touch = 0;
+			bool touch = false;
 			
 			res = HidP_GetUsages(HidP_Input, 0x0D, 0, usages, &usageLength, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
 			if (res < 0)
@@ -465,7 +465,7 @@ LRESULT CALLBACK EventHandler(
 			
 			for (int j=0;j<usageLength;j++) {
 				if (usages[j]==0x42) {
-					touch = 1;
+					touch = true;
 					break;
 				}
 			}
@@ -478,7 +478,7 @@ LRESULT CALLBACK EventHandler(
 			int x,y;
 			x = getScaled(bottomRightX-topLeftX, 0x01, 0x30, 0x01, 0x30, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
 			if (x>=0) {
-				y = getScaled(bottomRightX-topLeftX, 0x01, 0x31, 0x01, 0x30, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
+				y = getScaled(bottomRightY-topLeftY, 0x01, 0x31, 0x01, 0x31, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
 				if (y>=0) {
 					x+=topLeftX;
 					y+=topLeftY;
@@ -500,16 +500,13 @@ LRESULT CALLBACK EventHandler(
 }
 
 void help() {
-	MessageBox(0, 
-"finger-draw [options]\n"
-"\n"
-"Options:\n\n"
-"--help : this message\n"
-"--shift-lift : lift pen on shift [default]\n"
-"--shift-down : lower pen on shift\n"
-"--shift-none : ignore shift key\n"
-"--window topLeftX,topLeftY,bottomRightX,bottomRightY : set box coordinates [default: full screen]\n"
-, "Help", 0);
+	puts("winprecision-drawing [option]\n"
+	"\n"\
+	"Options:\n"\
+	"--help / -h     : List the available options.\n"\
+	"--shift-penup   : Raise pen when [SHIFT] is used. (Default)\n"\
+	"--shift-pendown : Lower pen when [SHIFT] is used.\n"\
+	"--shift-none    : [SHIFT] is ignored.\n");
 }
 
 int processOptions(char* cmdLine) {
@@ -519,21 +516,14 @@ int processOptions(char* cmdLine) {
 
 	while (NULL != (token = strtok(src, " "))) {
 		src = NULL;
-		if (!strcmp(token, "--shift-lift")) {
+		if (!strcmp(token, "--shift-penup")) {
 			shiftMode = SHIFT_MODE_LIFT;
 		}
-		else if (!strcmp(token, "--shift-down")) {
+		else if (!strcmp(token, "--shift-pendown")) {
 			shiftMode = SHIFT_MODE_DOWN;
 		}
 		else if (!strcmp(token, "--shift-none")) {
 			shiftMode = SHIFT_MODE_NONE;
-		}
-		else if (!strcmp(token, "--window")) {
-			if (NULL == (token = strtok(src, " "))) {
-				help();
-				return 0;
-			}
-			sscanf(token,"%d,%d,%d,%d",&topLeftX,&topLeftY,&bottomRightX,&bottomRightY);
 		}
 		else if (!strcmp(token, "--help") || !strcmp(token, "-h")) {
 			help();
@@ -543,14 +533,13 @@ int processOptions(char* cmdLine) {
 	return 1;
 }
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
-    PSTR lpCmdLine, int nCmdShow)
-{
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance, PSTR lpCmdLine, int nCmdShow) {
     const char* class_name = "winprecision-drawing-class";
 	
-	SetProcessDPIAware();
+	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 	int screenWidth = GetSystemMetrics(SM_CXSCREEN);
 	int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+	
 	topLeftX = 0;
 	topLeftY = 0;
 	bottomRightX = screenWidth;
@@ -568,7 +557,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
     if (!RegisterClass(&window_class))
         return -1;
 
-    HWND window = CreateWindow(class_name, "finger-draw-2941248", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+    HWND window = CreateWindow(class_name, "winprecision-drawing-overlay", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
 	
     if (window == NULL)
         return -1;
@@ -577,13 +566,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
     WNDCLASS overlayClass = {0};
     overlayClass.lpfnWndProc = OverlayProc;
     overlayClass.hInstance = instance;
-    overlayClass.lpszClassName = "finger-draw-overlay";
+    overlayClass.lpszClassName = "winprecision-drawing-overlay";
     RegisterClass(&overlayClass);
 
     // Overlay window
     overlayWnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        "finger-draw-overlay",
+        "winprecision-drawing-overlay",
         NULL,
         WS_POPUP,
         topLeftX, topLeftY,
@@ -593,9 +582,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
     );
     SetLayeredWindowAttributes(overlayWnd, 0, 80, LWA_ALPHA);
     ShowWindow(overlayWnd, SW_HIDE);
-
-
-	//SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+	
+	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 
     RAWINPUTDEVICE rid[2];
 	//touchpad
@@ -615,50 +603,55 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
     queueReady = CreateEvent(NULL, FALSE, FALSE, (LPTSTR)("queueReady"));
     HANDLE queueThread = CreateThread(NULL, 0, handleQueue, NULL, 0, NULL);
 
-	// Initialize touchpad aspect ratio
+	// get touchpad aspect ratio
 	{
 		UINT nDevices;
 		GetRawInputDeviceList(NULL, &nDevices, sizeof(RAWINPUTDEVICELIST));
-		if (nDevices > 0) {
-			RAWINPUTDEVICELIST* deviceList = malloc(sizeof(RAWINPUTDEVICELIST) * nDevices);
-			GetRawInputDeviceList(deviceList, &nDevices, sizeof(RAWINPUTDEVICELIST));
+		if (nDevices == 0) goto aspect_ratio_done;
 
-			for (UINT i = 0; i < nDevices; i++) {
-				if (deviceList[i].dwType == RIM_TYPEHID) {
-					RID_DEVICE_INFO info = {0};
-					info.cbSize = sizeof(info);
-					UINT size = sizeof(info);
-					GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_DEVICEINFO, &info, &size);
+		RAWINPUTDEVICELIST* deviceList = malloc(sizeof(RAWINPUTDEVICELIST) * nDevices);
+		if (!deviceList) goto aspect_ratio_done;
 
-					if (info.hid.usUsagePage == 0x0D && info.hid.usUsage == 0x05) {
-						// Found touchpad device
-						PHIDP_PREPARSED_DATA preparsed;
-						size = 0;
-						GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_PREPARSEDDATA, NULL, &size);
-						preparsed = malloc(size);
-						GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_PREPARSEDDATA, preparsed, &size);
+		GetRawInputDeviceList(deviceList, &nDevices, sizeof(RAWINPUTDEVICELIST));
 
-						HIDP_CAPS caps;
-						if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
-							HIDP_VALUE_CAPS capsX[10], capsY[10];
-							USHORT lenX = 10, lenY = 10;
-							HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, 0x30, capsX, &lenX, preparsed);
-							HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, 0x31, capsY, &lenY, preparsed);
+		for (UINT i = 0; i < nDevices; i++) {
+			if (deviceList[i].dwType == RIM_TYPEHID) {
+				RID_DEVICE_INFO info = {0};
+				info.cbSize = sizeof(info);
+				UINT size = sizeof(info);
+				GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_DEVICEINFO, &info, &size);
 
-							int tpWidth  = capsX[0].LogicalMax - capsX[0].LogicalMin + 1;
-							int tpHeight = capsY[0].LogicalMax - capsY[0].LogicalMin + 1;
-							touchpadAspect = tpWidth / (float)tpHeight;
-						}
+				if (info.hid.usUsagePage == 0x0D && info.hid.usUsage == 0x05) {
+					PHIDP_PREPARSED_DATA preparsed;
+					size = 0;
+					GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_PREPARSEDDATA, NULL, &size);
 
-						free(preparsed);
-						break;
+					preparsed = malloc(size);
+					if (!preparsed) break;
+
+					GetRawInputDeviceInfo(deviceList[i].hDevice, RIDI_PREPARSEDDATA, preparsed, &size);
+
+					HIDP_CAPS caps;
+					if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
+						HIDP_VALUE_CAPS capsX[10], capsY[10];
+						USHORT lenX = 10, lenY = 10;
+						HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, 0x30, capsX, &lenX, preparsed);
+						HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, 0x31, capsY, &lenY, preparsed);
+
+						int tpWidth  = capsX[0].LogicalMax - capsX[0].LogicalMin + 1;
+						int tpHeight = capsY[0].LogicalMax - capsY[0].LogicalMin + 1;
+						aspectRatio = tpWidth / (float)tpHeight;
 					}
+
+					free(preparsed);
+					break;
 				}
 			}
-
-			free(deviceList);
 		}
+
+		free(deviceList);
 	}
+	aspect_ratio_done: // when something fails abovee we use this and fallback on default values
 
 	SetConsoleTitle("winprecision-drawing");
 
@@ -677,9 +670,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
         DispatchMessage(&message);
     }
 
-    running = 0;
+    running = false;
+
     SetEvent(queueReady);
-    UnhookWindowsHookEx(miHook);
+    if (miHook) UnhookWindowsHookEx(miHook);
+
+	CloseHandle(queueThread);
+	CloseHandle(queueReady);
 
     return 0;
 }
